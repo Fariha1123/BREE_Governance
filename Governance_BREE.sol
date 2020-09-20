@@ -37,16 +37,10 @@ library SafeMath {
 // ----------------------------------------------------------------------------
 // ERC Token Standard #20 Interface
 // ----------------------------------------------------------------------------
-interface IERC20 {
-    function totalSupply() external view returns (uint256);
-    function balanceOf(address tokenOwner) external view returns (uint256 balance);
-    function allowance(address tokenOwner, address spender) external view returns (uint256 remaining);
+interface IBREE {
     function transfer(address to, uint256 tokens) external returns (bool success);
-    function approve(address spender, uint256 tokens) external returns (bool success);
     function transferFrom(address from, address to, uint256 tokens) external returns (bool success);
-    function burnTokens(uint256 _amount) external;
-    event Transfer(address indexed from, address indexed to, uint256 tokens);
-    event Approval(address indexed tokenOwner, address indexed spender, uint256 tokens);
+    function BurnTokens(uint256 _amount) external;
 }
 
 contract Governance{
@@ -70,38 +64,32 @@ contract Governance{
     
     struct Proposal{
         uint256 id;
-        string description;
+        string  description;
         uint256 categoryId;
-        uint256 startTime;
         uint256 endTime;
         uint256 yesVotes;
         uint256 noVotes; 
         address creator;
         uint256 yesTrustScores;
         uint256 noTrustScores;
-        uint256 totalBreePaid;
-        Status status;
+        uint256 creatorPortion;
+        uint256 yesVotersPortion;
+        Status  status;
     }
     
     struct proposalsVotes{
         bool voted;
         bool choice; // true = yes, false = no
         uint256 breePaid;
+        bool rewardsClaimed;
+        uint256 totalClaimed;
     }
     
     struct Voters{
         mapping(uint256 => proposalsVotes) proposalsVoted;
-        uint256 gainedTrustScore;
-        uint256 deductedTrustScore;
-        uint256 trustScoreLastUpdated; // save the index of allProposalsVoted till where we calculated trust score
-        uint256[] allProposalsVoted;
-    }
-    
-    // TODO trust score logic
-    function trustScore(address user) private returns(uint256 _trustScore){
-        for(uint256 i = voters[user].trustScoreLastUpdated; i<= voters[user].allProposalsVoted.length; i++){
-            
-        }
+        uint256 latestTrustScore;
+        mapping(uint256 => uint256 ) allProposalsVoted;
+        uint256 totalClaimed;
     }
     
     mapping(address => Voters) voters;
@@ -139,12 +127,12 @@ contract Governance{
     }
     
     // Create proposal by paying fee in BREE
-    function CREATE_PROPOSAL(uint256 categoryId, string memory ideaDescription) external validCategory(categoryId) descriptionNotNull(ideaDescription){
+    function CREATE_PROPOSAL(uint256 categoryId, string calldata ideaDescription) external validCategory(categoryId) descriptionNotNull(ideaDescription){
         // get the fee from user
-        IERC20(BREE).transferFrom(msg.sender, address(this), _calculateProposalFee());
+        require(IBREE(BREE).transferFrom(msg.sender, address(this), _calculateProposalFee()));
         
         // burn the received tokens
-        IERC20(BREE).burnTokens(_calculateProposalFee());
+        IBREE(BREE).BurnTokens(_calculateProposalFee());
         
         // REGISTER THE PROPOSAL
         
@@ -156,7 +144,6 @@ contract Governance{
            id: totalProposals,
            description: ideaDescription,
            categoryId: categoryId,
-           startTime: block.timestamp,
            endTime: block.timestamp.add(proposalPeriod),
            status: Status.ACTIVE,
            creator: msg.sender,
@@ -164,20 +151,20 @@ contract Governance{
            noVotes: 0,
            yesTrustScores: 0,
            noTrustScores: 0,
-           totalBreePaid: 0
+           creatorPortion: 0,
+           yesVotersPortion: 0
         });
     }
     
     // TO DO LOGIC
-    function _calculateProposalFee() private returns(uint256 _fee){
+    function _calculateProposalFee() private pure returns(uint256 _fee){
         return 2; // in bree
     }
     
     // check if proposal is active
-    function _updatedProposalStatus(uint256 proposalId) private returns(bool _activeStatus){
-        require(proposals[proposalId].status == Status.ACTIVE, "INACTIVE: Proposal is not active");
+    function _updatedProposalStatus(uint256 proposalId) private returns(bool){
         // check if it is NOT in valid time frame
-        if(block.timestamp > proposals[proposalId].endTime){
+        if(block.timestamp > proposals[proposalId].endTime && proposals[proposalId].status == Status.ACTIVE){
             // check if yesVotes is greater than noVotes AND yesTrustScores is greater/equal to noTrustScores
             if(proposals[proposalId].yesVotes > proposals[proposalId].noVotes && proposals[proposalId].yesTrustScores >= proposals[proposalId].noTrustScores)
                 proposals[proposalId].status = Status.ACCEPTED;
@@ -187,18 +174,52 @@ contract Governance{
             else // no resolution is met
             {
                 proposals[proposalId].status = Status.ACTIVE;
-                proposals[proposalId].startTime = proposals[proposalId].endTime;
                 proposals[proposalId].endTime = proposals[proposalId].endTime.add(proposalPeriod);
             }
         }
+        return true;
     }
     
+    function updateTrustScore(address user) private returns(bool){
+        
+        voters[user].latestTrustScore = 0;
+        
+        for(uint256 i = totalProposals; i>= totalProposals.sub(5); i--){    
+            uint256 proposalId = proposals[i].id;
+            if(proposals[proposalId].status == Status.ACCEPTED){
+                if(voters[user].proposalsVoted[proposalId].choice == true){ // yes
+                    // +1
+                    voters[user].latestTrustScore = voters[user].latestTrustScore.add(1);
+                }
+                else{
+                    // -1
+                    voters[user].latestTrustScore = voters[user].latestTrustScore.sub(1);
+                }
+            }
+            else if(proposals[proposalId].status == Status.REJECTED){
+                if(voters[user].proposalsVoted[proposalId].choice == false){ // no
+                    // +1
+                    voters[user].latestTrustScore = voters[user].latestTrustScore.add(1);
+                }
+                else{
+                    // -1
+                    voters[user].latestTrustScore = voters[user].latestTrustScore.sub(1);
+                }
+            }
+        }
+        
+        return true;
+    }
     
     // Vote for a proposal by paying fee in BREE
-    function VOTE(uint256 proposalId, bool voteChoice) public notVoted(proposalId){
+    function VOTE(uint256 proposalId, bool voteChoice, uint256 votesPaidInBree) public notVoted(proposalId){
+        uint256 fee = _calculateVotingFee();
+        
+        // require that the votesPaid should be greater than min fee allowed
+        require(votesPaidInBree >= fee);
         
         // get the fee from user
-        IERC20(BREE).transferFrom(msg.sender, address(this), _calculateVotingFee());
+        require(IBREE(BREE).transferFrom(msg.sender, address(this), votesPaidInBree));
         
         // update the proposal status
         _updatedProposalStatus(proposalId);
@@ -207,40 +228,57 @@ contract Governance{
         require(proposals[proposalId].status == Status.ACTIVE, "INACTIVE: Proposal is not active");
         
         // check the vote choice and update the yesVotes OR noVotes AND yesTrustScores or noTrustScores
-        _castVote(proposalId, voteChoice, _calculateVotingFee());
+        _castVote(proposalId, voteChoice, votesPaidInBree);
+        
+        // distribute the fee
+            // burn 85% immediately
+            IBREE(BREE).BurnTokens(onePercent(votesPaidInBree).mul(85));
+            // keep 5% for contract creator
+            proposals[proposalId].creatorPortion = proposals[proposalId].creatorPortion.add(onePercent(votesPaidInBree).mul(5));
+            // keep 10% for yes voters
+            proposals[proposalId].yesVotersPortion = proposals[proposalId].yesVotersPortion.add(onePercent(votesPaidInBree).mul(10));
     }
     
     // TO DO LOGIC
-    function _calculateVotingFee() private returns(uint256 _fee){
+    function _calculateVotingFee() private pure returns(uint256 _fee){
         return 1; // in bree
     }
     
     // check the vote choice and update the yesVotes OR noVotes AND yesTrustScores or noTrustScores
     function _castVote(uint256 proposalId, bool voteChoice, uint256 feePaid) private{
         if(voteChoice){ // true i.e. YES
-            // increment yesVotes
-            proposals[proposalId].yesVotes = proposals[proposalId].yesVotes.add(1);
+            // keep record of tokens paid for yes votes
+            proposals[proposalId].yesVotes = proposals[proposalId].yesVotes.add(feePaid);
             // add the trust score of the user to yesTrustScores
-            proposals[proposalId].yesTrustScores = (proposals[proposalId].yesTrustScores).add(trustScore(voteChoice));
+            proposals[proposalId].yesTrustScores = (proposals[proposalId].yesTrustScores).add(voters[msg.sender].latestTrustScore);
+            
         } else{
-            // increment noVotes
-            proposals[proposalId].noVotes = proposals[proposalId].noVotes.add(1);
+            // keep record of tokens paid for no votes
+            proposals[proposalId].noVotes = proposals[proposalId].noVotes.add(feePaid);
             // add the trust score of the user to noTrustScores
-            proposals[proposalId].noTrustScores = (proposals[proposalId].noTrustScores).add(trustScore(voteChoice));
+            proposals[proposalId].noTrustScores = (proposals[proposalId].noTrustScores).add(voters[msg.sender].latestTrustScore);
         }
         
         voters[msg.sender].proposalsVoted[proposalId].voted = true;
         voters[msg.sender].proposalsVoted[proposalId].choice = voteChoice;
         voters[msg.sender].proposalsVoted[proposalId].breePaid = feePaid;
         
-        proposals[proposalId].totalBreePaid = proposals[proposalId].totalBreePaid.add(feePaid);
     }
-    
-    
-    
-    // TODO
-    function claimEarnings() external{
-        uint256 pendingEarnings;
+
+    function claimEarnings(uint256 proposalId) external{
+        // update the proposal status
+        _updatedProposalStatus(proposalId);
+        
+        uint256 pendingEarnings = claimableEarnings(proposalId, msg.sender);
+        
+        // send token portion
+        IBREE(BREE).transfer(msg.sender, pendingEarnings);
+        
+        // update that the user has claimed the rewards
+        voters[msg.sender].proposalsVoted[proposalId].rewardsClaimed = true;
+        
+        voters[msg.sender].totalClaimed = voters[msg.sender].totalClaimed.add(pendingEarnings);
+        voters[msg.sender].proposalsVoted[proposalId].totalClaimed = voters[msg.sender].proposalsVoted[proposalId].totalClaimed.add(pendingEarnings);
         totalEarningsClaimed = totalEarningsClaimed.add(pendingEarnings);
     }
     
@@ -280,7 +318,9 @@ contract Governance{
                 }
             } 
             else{
-                return proposals[proposalId].endTime.sub(proposals[proposalId].startTime);
+                if(proposals[proposalId].endTime > block.timestamp)
+                    return proposals[proposalId].endTime.sub(block.timestamp);
+                else return 0;
             }
         }
         else return 0;
@@ -298,15 +338,116 @@ contract Governance{
         return (_choice, voters[user].proposalsVoted[proposalId].breePaid);
     }
     
-    function claimableEarnings(uint256 proposalId, address user) external view returns(uint256){
-        return 0;
+    function claimableEarnings(uint256 proposalId, address user) public view returns(uint256 _claimableEarnings){
+        if(proposals[proposalId].status != Status.ACTIVE){
+
+            uint256 tokenPortion = 0;
+            uint256 userPortion = 0;
+        
+            if(proposals[proposalId].status == Status.ACCEPTED){
+          
+                require(!voters[msg.sender].proposalsVoted[proposalId].rewardsClaimed, "Already claimed");
+          
+                if(voters[msg.sender].proposalsVoted[proposalId].choice == true){
+            // check the total bree's paid for yes
+            tokenPortion = proposals[proposalId].yesVotersPortion.div(proposals[proposalId].yesVotes);
+            userPortion = voters[msg.sender].proposalsVoted[proposalId].breePaid.mul(tokenPortion);
+          } 
+            
+                if(proposals[proposalId].creator == user){
+                    userPortion = userPortion.add(proposals[proposalId].creatorPortion);
+                }
+          
+                return userPortion;
+            } 
+            else if(proposals[proposalId].status == Status.REJECTED && voters[msg.sender].proposalsVoted[proposalId].choice == false){
+                require(!voters[msg.sender].proposalsVoted[proposalId].rewardsClaimed, "Already claimed");
+            
+                // check the total bree's paid for yes
+                tokenPortion = proposals[proposalId].yesVotersPortion.div(proposals[proposalId].noVotes);
+                userPortion = voters[msg.sender].proposalsVoted[proposalId].breePaid.mul(tokenPortion);
+            }
+        }
     }
     
-    function userTotalClaimedEarnings(uint256 proposalId, address user) external view returns(uint256){
-        return 0;
+    function userTotalClaimedEarnings(address user) external view returns(uint256){
+        return voters[user].totalClaimed; 
+    }
+    
+    function userClaimedEarnings(uint256 proposalId, address user) external view returns(uint256){
+        return voters[user].proposalsVoted[proposalId].totalClaimed; 
     }
     
     function totalClaimedEarningsOfAllUsers() external view returns (uint256) {
         return totalEarningsClaimed;
+    }
+    
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    ///////////////////////////////////////////////// TRUST SCORES QUERY FUNCTIONS ////////////////////////////////////////////////////
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    
+    function myTrustScoreBalance(address user) external view returns(uint256){
+        uint256 totalTrustScore = 0;
+        for(uint256 i = totalProposals; i>= totalProposals.sub(5); i--){    
+            uint256 proposalId = proposals[i].id; 
+            if(proposals[proposalId].status == Status.ACCEPTED){
+                if(voters[user].proposalsVoted[proposalId].choice == true){ // yes
+                    // +1
+                    totalTrustScore = totalTrustScore.add(1);
+                }
+                else{
+                    // -1
+                    totalTrustScore = totalTrustScore.sub(1);
+                }
+            }
+            else if(proposals[proposalId].status == Status.REJECTED){
+                if(voters[user].proposalsVoted[proposalId].choice == false){ // no
+                    // +1
+                    totalTrustScore = totalTrustScore.add(1);
+                }
+                else{
+                    // -1
+                    totalTrustScore = totalTrustScore.sub(1);
+                }
+            }
+        }
+        return totalTrustScore;
+    }
+    
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    ///////////////////////////////////////////////// OWNER FUNCTIONS ////////////////////////////////////////////////////
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    
+    function changeProposalCreationFee(uint256 usdValue) external {
+        proposalCreationFeeUSD = usdValue;
+    }
+    
+    function changeProposalCreatorAllocations(uint256 newAllocation) external{
+        // require
+    }
+    
+    function changeWinningVotersAllocations(uint256 newAllocation) external{
+        // require 
+    }
+    
+    function changeBurningAllocations(uint256 newAllocation) external{
+        // require
+    }
+    
+    function changeVotingPeriod(uint256 newVotingPeriod) external{
+        proposalPeriod = newVotingPeriod;
+    }
+    
+    function changeMinimumFeeOfVotes(uint256 newAllowedMinimumFee) external{
+        votingFeeUSD = newAllowedMinimumFee;
+    }
+    
+    // ------------------------------------------------------------------------
+    // Calculates onePercent of the uint256 amount sent
+    // ------------------------------------------------------------------------
+    function onePercent(uint256 _tokens) internal pure returns (uint256){
+        uint256 roundValue = _tokens.ceil(100);
+        uint onePercentofTokens = roundValue.mul(100).div(100 * 10**uint(2));
+        return onePercentofTokens;
     }
 }
